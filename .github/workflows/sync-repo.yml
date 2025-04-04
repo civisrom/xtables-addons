@@ -1,0 +1,109 @@
+name: Sync Xtables-Addons Repository
+
+on:
+  # Запуск по расписанию (еженедельно в понедельник в 3:00 UTC)
+  schedule:
+    - cron: '0 3 * * 1'
+  
+  # Возможность ручного запуска
+  workflow_dispatch:
+  
+  # Опционально: запуск при push в ваш репозиторий (если нужно)
+  # push:
+  #   branches: [ master ]
+
+jobs:
+  sync-repo:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: master
+      
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      - name: Setup Git user
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+      
+      - name: Add Codeberg repository as remote
+        run: |
+          git remote add codeberg https://codeberg.org/jengelh/xtables-addons.git
+      
+      - name: Fetch from Codeberg
+        run: |
+          git fetch codeberg
+      
+      - name: Check for changes
+        id: check_changes
+        run: |
+          LATEST_CODEBERG_COMMIT=$(git rev-parse codeberg/master)
+          LATEST_LOCAL_COMMIT=$(git rev-parse origin/master)
+          
+          if [ "$LATEST_CODEBERG_COMMIT" != "$LATEST_LOCAL_COMMIT" ]; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            
+            # Получаем информацию о новых коммитах для использования в сообщении
+            COMMIT_COUNT=$(git rev-list --count origin/master..codeberg/master)
+            LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master)
+            COMMIT_AUTHORS=$(git log --pretty=format:"%an" origin/master..codeberg/master | sort | uniq | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g')
+            
+            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+            echo "last_commit_msg=$LAST_COMMIT_MSG" >> $GITHUB_OUTPUT
+            echo "commit_authors=$COMMIT_AUTHORS" >> $GITHUB_OUTPUT
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Merge changes if there are any
+        if: steps.check_changes.outputs.changes_detected == 'true'
+        run: |
+          # Создаем временную ветку для слияния изменений
+          git checkout -b temp-sync-branch
+          
+          # Мерджим изменения с Codeberg
+          git merge --no-commit codeberg/master
+          
+          # Проверяем наличие конфликтов
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Merge conflicts detected. The workflow will attempt to resolve them."
+            
+            # Стратегия разрешения конфликтов: принимаем изменения из upstream
+            git checkout --theirs .
+            git add .
+            
+            echo "Conflicts resolved by accepting upstream changes."
+          fi
+          
+          # Формируем информативное сообщение коммита
+          if [ "${{ steps.check_changes.outputs.commit_count }}" -eq "1" ]; then
+            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.last_commit_msg }}"
+          else
+            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.commit_count }} new commits from Codeberg by ${{ steps.check_changes.outputs.commit_authors }}"
+          fi
+          
+          # Коммитим изменения
+          git commit -m "$COMMIT_MSG"
+          
+          # Переключаемся на master и мерджим изменения
+          git checkout master
+          git merge temp-sync-branch
+          
+          # Отправляем изменения в GitHub
+          git push origin master
+      
+      - name: Report sync status
+        if: always()
+        run: |
+          if [ "${{ steps.check_changes.outputs.changes_detected }}" == "true" ]; then
+            echo "✅ Repository successfully synchronized with ${{ steps.check_changes.outputs.commit_count }} new commits"
+          else
+            echo "ℹ️ No changes detected in the upstream repository"
+          fi
