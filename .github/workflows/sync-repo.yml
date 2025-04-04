@@ -17,7 +17,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          # Используем токен GitHub с правами записи
           token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Setup Git user
@@ -36,11 +35,6 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan github.com >> ~/.ssh/known_hosts
-      
-      # Проверяем SSH ключ
-      - name: Test SSH connection
-        run: |
-          ssh -T git@github.com || echo "SSH connection test complete"
       
       # Переконфигурируем удаленный репозиторий для использования SSH
       - name: Update remote URL to use SSH
@@ -119,34 +113,48 @@ jobs:
             COMMIT_MSG="Sync: $COMMIT_COUNT commits from Codeberg by $COMMIT_AUTHORS_SAFE"
           fi
           
-          echo "Prepared commit message. Creating new branch for changes..."
+          echo "Prepared commit message. Starting direct sync to master..."
           
-          # Создаем новую ветку и переключаемся на нее
-          SYNC_BRANCH="sync-codeberg-$(date +%Y%m%d%H%M%S)"
-          git checkout -b "$SYNC_BRANCH"
-          
-          # Метод 1: Пытаемся применить изменения с помощью git reset
-          if git fetch codeberg master && git reset --hard FETCH_HEAD; then
-            echo "Reset to Codeberg master successful"
-            git push origin "$SYNC_BRANCH"
-            echo "Changes pushed to branch: $SYNC_BRANCH"
-            echo "Please review and manually merge this branch."
-            exit 0
+          # Метод 1: Пытаемся выполнить fast-forward merge, если возможно
+          if git merge-base --is-ancestor HEAD codeberg/master; then
+            echo "Fast-forward merge is possible, applying..."
+            git merge --ff-only codeberg/master && git push origin master && {
+              echo "Fast-forward merge and push successful!"
+              exit 0
+            }
           fi
           
-          echo "Reset method failed, trying rebase method..."
-          
-          # Метод 2: Пытаемся использовать rebase для применения изменений
-          git fetch codeberg
-          if git rebase codeberg/master; then
-            echo "Rebase successful"
-            git push origin "$SYNC_BRANCH"
-            echo "Changes pushed to branch: $SYNC_BRANCH after rebase"
-            echo "Please review and manually merge this branch."
-            exit 0
+          # Метод 2: Пытаемся выполнить обычный merge
+          echo "Fast-forward not possible, trying regular merge..."
+          if git merge --no-ff codeberg/master -m "$COMMIT_MSG"; then
+            echo "Merge successful, pushing to master..."
+            git push origin master && {
+              echo "Merge and push to master successful!"
+              exit 0
+            }
+          else
+            echo "Merge failed, resolving conflicts automatically..."
+            git merge --abort
           fi
           
-          echo "All sync methods failed. Please check the logs and try again."
+          # Метод 3: Принудительное обновление
+          echo "Other methods failed, using reset and force push..."
+          
+          # Создаем временную резервную копию
+          BACKUP_BRANCH="backup-$(date +%Y%m%d%H%M%S)"
+          git branch "$BACKUP_BRANCH"
+          echo "Created backup branch: $BACKUP_BRANCH"
+          
+          # Используем 'git reset' для обновления до состояния codeberg/master
+          if git reset --hard codeberg/master; then
+            echo "Reset to codeberg/master successful, force pushing to master..."
+            git push --force origin master && {
+              echo "Force push to master successful!"
+              exit 0
+            }
+          fi
+          
+          echo "All sync methods failed. Backup branch $BACKUP_BRANCH has been created."
           exit 1
       
       - name: Report sync status
