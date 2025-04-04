@@ -72,28 +72,29 @@ jobs:
               
               # Проверяем наличие изменений (с обработкой ошибок)
               if git diff --exit-code HEAD..codeberg/master &>/dev/null; then
-                echo "changes_detected=false" >> $GITHUB_OUTPUT
+                echo "changes_detected=false" >> "$GITHUB_OUTPUT"
                 echo "Commits are different but no file changes detected."
               else
-                echo "changes_detected=true" >> $GITHUB_OUTPUT
+                echo "changes_detected=true" >> "$GITHUB_OUTPUT"
                 echo "Changes detected in files."
                 
                 # Получаем информацию о коммитах только если есть изменения
-                COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master) || COMMIT_COUNT="несколько"
-                LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master) || LAST_COMMIT_MSG="Sync from Codeberg"
-                COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master | sort | uniq | head -3 | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g') || COMMIT_AUTHORS="upstream contributors"
+                COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master 2>/dev/null) || COMMIT_COUNT="несколько"
+                # Используем base64 для безопасной передачи сообщения коммита
+                LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master 2>/dev/null | base64) || LAST_COMMIT_MSG=$(echo "Sync from Codeberg" | base64)
+                COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master 2>/dev/null | sort | uniq | head -3 | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g' | base64) || COMMIT_AUTHORS=$(echo "upstream contributors" | base64)
                 
-                echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-                echo "last_commit_msg=$LAST_COMMIT_MSG" >> $GITHUB_OUTPUT
-                echo "commit_authors=$COMMIT_AUTHORS" >> $GITHUB_OUTPUT
+                echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+                echo "last_commit_msg=$LAST_COMMIT_MSG" >> "$GITHUB_OUTPUT"
+                echo "commit_authors=$COMMIT_AUTHORS" >> "$GITHUB_OUTPUT"
               fi
             else
-              echo "changes_detected=false" >> $GITHUB_OUTPUT
+              echo "changes_detected=false" >> "$GITHUB_OUTPUT"
               echo "Repositories are already in sync."
             fi
           else
             echo "Failed to find codeberg/master branch. Check remote URL and connection."
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "changes_detected=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
       
@@ -102,65 +103,51 @@ jobs:
         run: |
           echo "Starting sync process..."
           
-          # Формируем информативное сообщение коммита
+          # Декодируем значения из base64
           COMMIT_COUNT="${{ steps.check_changes.outputs.commit_count }}"
-          LAST_COMMIT_MSG="${{ steps.check_changes.outputs.last_commit_msg }}"
-          COMMIT_AUTHORS="${{ steps.check_changes.outputs.commit_authors }}"
+          LAST_COMMIT_MSG=$(echo "${{ steps.check_changes.outputs.last_commit_msg }}" | base64 --decode)
+          COMMIT_AUTHORS=$(echo "${{ steps.check_changes.outputs.commit_authors }}" | base64 --decode)
           
+          # Экранируем специальные символы в сообщении коммита
+          LAST_COMMIT_MSG_SAFE=$(echo "$LAST_COMMIT_MSG" | sed 's/["`$\\]/\\&/g')
+          COMMIT_AUTHORS_SAFE=$(echo "$COMMIT_AUTHORS" | sed 's/["`$\\]/\\&/g')
+          
+          # Формируем информативное сообщение коммита
           if [ "$COMMIT_COUNT" = "1" ]; then
-            COMMIT_MSG="Sync: $LAST_COMMIT_MSG"
+            COMMIT_MSG="Sync: $LAST_COMMIT_MSG_SAFE"
           else
-            COMMIT_MSG="Sync: $COMMIT_COUNT commits from Codeberg by $COMMIT_AUTHORS"
+            COMMIT_MSG="Sync: $COMMIT_COUNT commits from Codeberg by $COMMIT_AUTHORS_SAFE"
           fi
           
-          echo "Commit message: $COMMIT_MSG"
+          echo "Prepared commit message. Creating new branch for changes..."
           
-          # Метод 1: Пытаемся использовать cherry-pick для новых коммитов
-          echo "Trying cherry-pick method..."
-          COMMITS_TO_PICK=$(git rev-list HEAD..codeberg/master --reverse)
-          
-          if [ -n "$COMMITS_TO_PICK" ]; then
-            # Итерируем по каждому коммиту и применяем его
-            for COMMIT in $COMMITS_TO_PICK; do
-              git cherry-pick $COMMIT || {
-                echo "Cherry-pick failed for commit $COMMIT, trying merge instead..."
-                git cherry-pick --abort
-                break
-              }
-            done
-            
-            # Если cherry-pick был успешным, пушим изменения
-            if [ $? -eq 0 ]; then
-              echo "Cherry-picking successful, pushing changes..."
-              git push origin master && exit 0
-            fi
-          fi
-          
-          # Метод 2: Пытаемся выполнить обычный merge
-          echo "Trying merge method..."
-          if git merge --no-ff codeberg/master -m "$COMMIT_MSG"; then
-            echo "Merge successful, pushing changes..."
-            git push origin master && exit 0
-          else
-            echo "Merge conflicts detected, aborting merge..."
-            git merge --abort
-          fi
-          
-          # Метод 3: Создаем новую ветку с изменениями
-          echo "Creating a new branch with changes..."
+          # Создаем новую ветку и переключаемся на нее
           SYNC_BRANCH="sync-codeberg-$(date +%Y%m%d%H%M%S)"
-          git checkout -b $SYNC_BRANCH
+          git checkout -b "$SYNC_BRANCH"
           
-          if git reset --hard codeberg/master; then
-            echo "Reset to codeberg/master successful, pushing new branch..."
-            git push origin $SYNC_BRANCH
-            
+          # Метод 1: Пытаемся применить изменения с помощью git reset
+          if git fetch codeberg master && git reset --hard FETCH_HEAD; then
+            echo "Reset to Codeberg master successful"
+            git push origin "$SYNC_BRANCH"
             echo "Changes pushed to branch: $SYNC_BRANCH"
             echo "Please review and manually merge this branch."
-          else
-            echo "Failed to reset to codeberg/master"
-            exit 1
+            exit 0
           fi
+          
+          echo "Reset method failed, trying rebase method..."
+          
+          # Метод 2: Пытаемся использовать rebase для применения изменений
+          git fetch codeberg
+          if git rebase codeberg/master; then
+            echo "Rebase successful"
+            git push origin "$SYNC_BRANCH"
+            echo "Changes pushed to branch: $SYNC_BRANCH after rebase"
+            echo "Please review and manually merge this branch."
+            exit 0
+          fi
+          
+          echo "All sync methods failed. Please check the logs and try again."
+          exit 1
       
       - name: Report sync status
         if: always()
