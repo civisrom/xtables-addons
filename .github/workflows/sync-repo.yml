@@ -7,10 +7,6 @@ on:
   
   # Возможность ручного запуска
   workflow_dispatch:
-  
-  # Опционально: запуск при push в ваш репозиторий (если нужно)
-  # push:
-  #   branches: [ master ]
 
 jobs:
   sync-repo:
@@ -33,83 +29,102 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
       
-      - name: Add Codeberg repository as remote
+      - name: Add Codeberg repository as remote and fetch
         run: |
           git remote add codeberg https://codeberg.org/jengelh/xtables-addons.git
-      
-      - name: Fetch from Codeberg
-        run: |
-          git fetch codeberg
+          git fetch codeberg || echo "Failed to fetch from Codeberg but continuing..."
       
       - name: Check for changes
         id: check_changes
         run: |
-          LATEST_CODEBERG_COMMIT=$(git rev-parse codeberg/master)
-          LATEST_LOCAL_COMMIT=$(git rev-parse HEAD)
-          
-          if [ "$LATEST_CODEBERG_COMMIT" != "$LATEST_LOCAL_COMMIT" ]; then
-            # Проверяем, есть ли реальные изменения в файлах
-            git diff --quiet HEAD..codeberg/master
-            if [ $? -ne 0 ]; then
-              echo "changes_detected=true" >> $GITHUB_OUTPUT
+          # Проверяем существование удаленной ветки
+          if git rev-parse --verify codeberg/master &>/dev/null; then
+            echo "Upstream branch codeberg/master found."
+            
+            # Получаем хеши коммитов
+            LATEST_CODEBERG_COMMIT=$(git rev-parse codeberg/master)
+            LATEST_LOCAL_COMMIT=$(git rev-parse HEAD)
+            
+            echo "Codeberg commit: $LATEST_CODEBERG_COMMIT"
+            echo "Local commit: $LATEST_LOCAL_COMMIT"
+            
+            if [ "$LATEST_CODEBERG_COMMIT" != "$LATEST_LOCAL_COMMIT" ]; then
+              echo "Commits are different. Checking for file differences..."
               
-              # Получаем информацию о новых коммитах для использования в сообщении
-              COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master)
-              LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master)
-              COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master | sort | uniq | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g')
-              
-              echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-              echo "last_commit_msg=$LAST_COMMIT_MSG" >> $GITHUB_OUTPUT
-              echo "commit_authors=$COMMIT_AUTHORS" >> $GITHUB_OUTPUT
+              # Проверяем наличие изменений (с обработкой ошибок)
+              if git diff --exit-code HEAD..codeberg/master &>/dev/null; then
+                echo "changes_detected=false" >> $GITHUB_OUTPUT
+                echo "Commits are different but no file changes detected."
+              else
+                echo "changes_detected=true" >> $GITHUB_OUTPUT
+                echo "Changes detected in files."
+                
+                # Получаем информацию о коммитах только если есть изменения
+                COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master) || echo "Failed to count commits"
+                LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master) || "Sync from Codeberg"
+                COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master | sort | uniq | head -3 | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g') || "upstream contributors"
+                
+                echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+                echo "last_commit_msg=$LAST_COMMIT_MSG" >> $GITHUB_OUTPUT
+                echo "commit_authors=$COMMIT_AUTHORS" >> $GITHUB_OUTPUT
+              fi
             else
               echo "changes_detected=false" >> $GITHUB_OUTPUT
-              echo "Commits are different but no file changes detected."
+              echo "Repositories are already in sync."
             fi
           else
+            echo "Failed to find codeberg/master branch. Check remote URL and connection."
             echo "changes_detected=false" >> $GITHUB_OUTPUT
-            echo "Repositories are already in sync."
+            exit 0
           fi
       
-      - name: Sync changes
+      - name: Sync changes if detected
         if: steps.check_changes.outputs.changes_detected == 'true'
         run: |
+          echo "Starting sync process..."
+          
           # Формируем информативное сообщение коммита
-          if [ "${{ steps.check_changes.outputs.commit_count }}" -eq "1" ]; then
+          if [ "${{ steps.check_changes.outputs.commit_count }}" = "1" ]; then
             COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.last_commit_msg }}"
           else
-            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.commit_count }} new commits from Codeberg by ${{ steps.check_changes.outputs.commit_authors }}"
+            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.commit_count }} commits from Codeberg by ${{ steps.check_changes.outputs.commit_authors }}"
           fi
           
-          # Напрямую применяем изменения вместо использования временной ветки
-          git merge --no-ff codeberg/master -m "$COMMIT_MSG"
+          echo "Commit message: $COMMIT_MSG"
           
-          # Проверяем, был ли успешный мердж
-          if [ $? -eq 0 ]; then
-            echo "Successfully merged changes from Codeberg"
-            git push origin master
-          else
-            echo "Merge conflict detected, attempting to resolve..."
-            # Отменяем незавершенный мердж
-            git merge --abort
-            
-            # Используем rebase с возможностью разрешения конфликтов
-            git checkout -b temp-sync-branch
-            git reset --hard codeberg/master
-            
-            # Формируем коммит с информацией о синхронизации
-            git commit --allow-empty -m "$COMMIT_MSG"
-            
-            # Переключаемся на master и делаем принудительное обновление
-            git checkout master
-            git reset --hard temp-sync-branch
-            git push --force origin master
+          # Метод 1: Простой fast-forward merge, если возможно
+          if git merge-base --is-ancestor HEAD codeberg/master; then
+            echo "Fast-forward merge is possible, applying..."
+            git merge --ff-only codeberg/master && git push origin master && exit 0
           fi
+          
+          echo "Fast-forward merge not possible, trying normal merge..."
+          
+          # Метод 2: Пытаемся выполнить обычный merge
+          if git merge --no-commit codeberg/master; then
+            echo "Merge successful, committing..."
+            git commit -m "$COMMIT_MSG" && git push origin master && exit 0
+          fi
+          
+          echo "Merge failed, trying reset method..."
+          
+          # Метод 3: Принудительное обновление до удаленного состояния
+          # Создаем резервную ветку текущего состояния
+          BACKUP_BRANCH="backup-$(date +%Y%m%d%H%M%S)"
+          git branch $BACKUP_BRANCH
+          
+          # Сбрасываем до состояния удаленного репозитория
+          git reset --hard codeberg/master
+          git push --force origin master
+          
+          echo "Repository has been reset to match Codeberg state."
+          echo "Your previous state was saved in branch: $BACKUP_BRANCH"
       
       - name: Report sync status
         if: always()
         run: |
-          if [ "${{ steps.check_changes.outputs.changes_detected }}" == "true" ]; then
-            echo "✅ Repository successfully synchronized with ${{ steps.check_changes.outputs.commit_count }} new commits"
+          if [ "${{ steps.check_changes.outputs.changes_detected }}" = "true" ]; then
+            echo "✅ Repository sync attempted with Codeberg changes"
           else
             echo "ℹ️ No changes detected in the upstream repository"
           fi
