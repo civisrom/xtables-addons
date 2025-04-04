@@ -17,18 +17,37 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          ref: master
-      
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.7.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Используем токен GitHub с правами записи
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Setup Git user
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
       
+      # Настройка SSH для доступа к вашему репозиторию
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      # Добавляем GitHub в известные хосты
+      - name: Add known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      
+      # Проверяем SSH ключ
+      - name: Test SSH connection
+        run: |
+          ssh -T git@github.com || echo "SSH connection test complete"
+      
+      # Переконфигурируем удаленный репозиторий для использования SSH
+      - name: Update remote URL to use SSH
+        run: |
+          git remote set-url origin git@github.com:civisrom/xtables-addons.git
+      
+      # Добавляем Codeberg репозиторий как remote и получаем данные
       - name: Add Codeberg repository as remote and fetch
         run: |
           git remote add codeberg https://codeberg.org/jengelh/xtables-addons.git
@@ -60,9 +79,9 @@ jobs:
                 echo "Changes detected in files."
                 
                 # Получаем информацию о коммитах только если есть изменения
-                COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master) || echo "Failed to count commits"
-                LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master) || "Sync from Codeberg"
-                COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master | sort | uniq | head -3 | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g') || "upstream contributors"
+                COMMIT_COUNT=$(git rev-list --count HEAD..codeberg/master) || COMMIT_COUNT="несколько"
+                LAST_COMMIT_MSG=$(git log -1 --pretty=format:"%s" codeberg/master) || LAST_COMMIT_MSG="Sync from Codeberg"
+                COMMIT_AUTHORS=$(git log --pretty=format:"%an" HEAD..codeberg/master | sort | uniq | head -3 | tr '\n' ', ' | sed 's/,$//' | sed 's/,/, /g') || COMMIT_AUTHORS="upstream contributors"
                 
                 echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
                 echo "last_commit_msg=$LAST_COMMIT_MSG" >> $GITHUB_OUTPUT
@@ -84,41 +103,64 @@ jobs:
           echo "Starting sync process..."
           
           # Формируем информативное сообщение коммита
-          if [ "${{ steps.check_changes.outputs.commit_count }}" = "1" ]; then
-            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.last_commit_msg }}"
+          COMMIT_COUNT="${{ steps.check_changes.outputs.commit_count }}"
+          LAST_COMMIT_MSG="${{ steps.check_changes.outputs.last_commit_msg }}"
+          COMMIT_AUTHORS="${{ steps.check_changes.outputs.commit_authors }}"
+          
+          if [ "$COMMIT_COUNT" = "1" ]; then
+            COMMIT_MSG="Sync: $LAST_COMMIT_MSG"
           else
-            COMMIT_MSG="Sync: ${{ steps.check_changes.outputs.commit_count }} commits from Codeberg by ${{ steps.check_changes.outputs.commit_authors }}"
+            COMMIT_MSG="Sync: $COMMIT_COUNT commits from Codeberg by $COMMIT_AUTHORS"
           fi
           
           echo "Commit message: $COMMIT_MSG"
           
-          # Метод 1: Простой fast-forward merge, если возможно
-          if git merge-base --is-ancestor HEAD codeberg/master; then
-            echo "Fast-forward merge is possible, applying..."
-            git merge --ff-only codeberg/master && git push origin master && exit 0
-          fi
+          # Метод 1: Пытаемся использовать cherry-pick для новых коммитов
+          echo "Trying cherry-pick method..."
+          COMMITS_TO_PICK=$(git rev-list HEAD..codeberg/master --reverse)
           
-          echo "Fast-forward merge not possible, trying normal merge..."
+          if [ -n "$COMMITS_TO_PICK" ]; then
+            # Итерируем по каждому коммиту и применяем его
+            for COMMIT in $COMMITS_TO_PICK; do
+              git cherry-pick $COMMIT || {
+                echo "Cherry-pick failed for commit $COMMIT, trying merge instead..."
+                git cherry-pick --abort
+                break
+              }
+            done
+            
+            # Если cherry-pick был успешным, пушим изменения
+            if [ $? -eq 0 ]; then
+              echo "Cherry-picking successful, pushing changes..."
+              git push origin master && exit 0
+            fi
+          fi
           
           # Метод 2: Пытаемся выполнить обычный merge
-          if git merge --no-commit codeberg/master; then
-            echo "Merge successful, committing..."
-            git commit -m "$COMMIT_MSG" && git push origin master && exit 0
+          echo "Trying merge method..."
+          if git merge --no-ff codeberg/master -m "$COMMIT_MSG"; then
+            echo "Merge successful, pushing changes..."
+            git push origin master && exit 0
+          else
+            echo "Merge conflicts detected, aborting merge..."
+            git merge --abort
           fi
           
-          echo "Merge failed, trying reset method..."
+          # Метод 3: Создаем новую ветку с изменениями
+          echo "Creating a new branch with changes..."
+          SYNC_BRANCH="sync-codeberg-$(date +%Y%m%d%H%M%S)"
+          git checkout -b $SYNC_BRANCH
           
-          # Метод 3: Принудительное обновление до удаленного состояния
-          # Создаем резервную ветку текущего состояния
-          BACKUP_BRANCH="backup-$(date +%Y%m%d%H%M%S)"
-          git branch $BACKUP_BRANCH
-          
-          # Сбрасываем до состояния удаленного репозитория
-          git reset --hard codeberg/master
-          git push --force origin master
-          
-          echo "Repository has been reset to match Codeberg state."
-          echo "Your previous state was saved in branch: $BACKUP_BRANCH"
+          if git reset --hard codeberg/master; then
+            echo "Reset to codeberg/master successful, pushing new branch..."
+            git push origin $SYNC_BRANCH
+            
+            echo "Changes pushed to branch: $SYNC_BRANCH"
+            echo "Please review and manually merge this branch."
+          else
+            echo "Failed to reset to codeberg/master"
+            exit 1
+          fi
       
       - name: Report sync status
         if: always()
